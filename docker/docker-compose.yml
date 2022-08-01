@@ -1,0 +1,53 @@
+version: "3"
+
+services:
+  localstack:
+    image: localstack/localstack
+    ports:
+      - "127.0.0.1:4510-4559:4510-4559"  # external service port range
+      - "127.0.0.1:4566:4566"            # LocalStack Edge Proxy
+    environment:
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - DEFAULT_REGION=sa-east-1
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock"
+      - "/${TMPDIR:-/tmp/localstack}:/tmp/localstack"
+
+  setup-resources:
+    image: mesosphere/aws-cli
+    volumes:
+      - ./dev_env:/project/dev_env
+    environment:
+      - AWS_ACCESS_KEY_ID=KEY1
+      - AWS_SECRET_ACCESS_KEY=SECRET1
+      - AWS_DEFAULT_REGION=sa-east-1
+    entrypoint: /bin/sh -c
+    command: >
+      "
+        echo ------------------ Sleeping ------------------
+        sleep 20
+        
+        echo ------------------ Creating topic SNS ------------------
+        aws sns create-topic --name raw_event_sns --endpoint-url=http://localstack:4566
+        
+        echo ------------------ Creating DLQs SQS ------------------
+        aws sqs create-queue --endpoint-url=http://localstack:4566 --queue-name dlq_open_diff_queue;
+        aws sqs create-queue --endpoint-url=http://localstack:4566 --queue-name dlq_close_diff_queue;
+        # aws sqs create-queue --endpoint-url=http://localstack:4566 --queue-name open_diff_queue;
+        # aws sqs create-queue --endpoint-url=http://localstack:4566 --queue-name close_diff_queue;      
+        echo ------------------ Creating ARN variables ------------------
+        export DLQ_OPEN_DIFF_SQS_ARN=$$(aws --endpoint-url=http://localhost:4566 --region=sa-east-1 sqs get-queue-attributes --queue-url http://localhost:4566/queue/dlq_open_diff_queue --attribute-names QueueArn --query 'Attributes.QueueArn' --output text)
+        export DLQ_CLOSE_DIFF_SQS_ARN=$$(aws --endpoint-url=http://localhost:4566 --region=sa-east-1 sqs get-queue-attributes --queue-url http://localhost:4566/queue/dlq_close_diff_queue --attribute-names QueueArn --query 'Attributes.QueueArn' --output text)
+        echo ------------------ Exporting ARN variables ------------------
+        # export $DLQ_OPEN_DIFF_SQS_ARN
+        # export $DLQ_CLOSE_DIFF_SQS_ARN
+        echo ------------------ Creating queues SQS ------------------
+        aws --endpoint-url=http://localstack:4566 sqs create-queue --queue-name open_diff_queue --attributes "RedrivePolicy.maxReceiveCount=1"
+        aws --endpoint-url=http://localstack:4566 sqs create-queue --queue-name close_diff_queue --attributes "RedrivePolicy.deadLetterTargetArn="$DLQ_CLOSE_DIFF_SQS_ARN",RedrivePolicy.maxReceiveCount=1"
+       
+        echo ------------------ Subscribing to SNS to SQS ------------------
+        aws --endpoint-url=http://localstack:4566 sns subscribe --topic-arn arn:aws:sns:sa-east-1:000000000000:raw_event_sns --protocol sqs --notification-endpoint http://localstack:4566/queue/open_diff_queue
+        aws --endpoint-url=http://localstack:4566 sns subscribe --topic-arn arn:aws:sns:sa-east-1:000000000000:raw_event_sns --protocol sqs --notification-endpoint http://localstack:4566/queue/close_diff_queue
+      "
+    depends_on:
+      - localstack
